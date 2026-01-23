@@ -1,8 +1,9 @@
 [project]
 name = "diffusers-lanpaint"
 version = "0.1.0"
-description = "Add your description here"
+description = "LanPaint implementation in diffusers w/ backported new model support"
 readme = "README.md"
+license = "GPT-3.0"
 authors = [
     { name = "Chaser Huang", email = "huangkangjing@gmail.com" }
 ]
