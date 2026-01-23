@@ -1,0 +1,17 @@
+[project]
+name = "diffusers-lanpaint"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Chaser Huang", email = "huangkangjing@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "diffusers>=0.36.0",
+    "torch>=2.10.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.8,<0.10.0"]
+build-backend = "uv_build"
