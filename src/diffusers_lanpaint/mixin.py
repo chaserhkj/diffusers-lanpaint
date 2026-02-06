@@ -43,6 +43,8 @@ class LanPaintMixIn(object):
 
 
         self.latent_image: Tensor | None = None
+
+        self._abts: tuple[Tensor, Tensor] | None = None
     
     def _init_image(self, 
                     batch_size: int,
@@ -68,15 +70,43 @@ class LanPaintMixIn(object):
         image = image.to(self.device)
         return image
     
+    # Check if model is flow model
+    # Currently this is done by checking if alphas_cumprod is provided by scheduler
+    @property
+    def is_flow(self)-> bool:
+        return hasattr(self.scheduler, "alphas_cumprod")
+
+    # Get abt vectors (abt, abt_next) from scheduler. This handles different scheduler architectures
+    @property
+    def abts(self) -> tuple[Tensor, Tensor]:
+        if self._abts is not None:
+            return self._abts
+        if self.is_flow:
+            # If alphas_cumprod is provided, this is a non-flow model, directly subscript alphas_cumprod using timesteps
+            abts = self.scheduler.alphas_cumprod[self.scheduler.timesteps]
+        else:
+            # If no alphas_cumprod, this is flow model, calculate abt from sigma (which is the same as flow_t)
+            sigmas: Tensor = self.scheduler.sigmas[:-1]
+            abts = (1-sigmas)**2/((1-sigmas)**2 + sigmas**2)
+        assert abts is not None
+        self._abts = (abts[:-1], abts[1:])
+        return self._abts
+    
+    # Get sigma vectors (sigma, sigma_next) from scheduler:
+    @property
+    def sigmas(self) -> tuple[Tensor, Tensor]:
+        return self.scheduler.sigmas[:-1], self.scheduler.sigmas[1:]
+    
     def _forward_diffuse(self, y: Tensor):
         # Forward diffusion of motif to get y at each step:
         # For simplicity, we use the scheduler's sigmas and same formula as in ConditionPipeline:
         # abt = 1/(1+sigma^2), so forward diffuse: y_t = sqrt(abt)*y + sqrt(1 - abt)*noise
+        # TODO: add manual seed control for noise used here
         y_forward_diffusion: list[Tensor] = []
         device = y.device
-        abts = ( 1/(1+self.scheduler.sigmas**2) ).flip(0)
+        abts = tuple(a.flip(0) for a in self.abts)
         y_t = y
-        for abt, abt_next in zip(abts[:-1], abts[1:]):
+        for abt, abt_next in zip(*abts):
             noise = torch.randn_like(y)
             y_t = y_t * (abt_next/abt)**0.5 + noise * ((1 - (abt_next/abt))**0.5)
             y_forward_diffusion.append(y_t.to(device))
@@ -93,7 +123,7 @@ class LanPaintMixIn(object):
     ) -> Tensor:
         batch_size = latent_image.shape[0]
         _ = self.denoiser.to(self.device) 
-        self.scheduler.set_timesteps() # pyright: ignore
+        self.scheduler.set_timesteps()
 
         y = latent_image
         self.latent_image = latent_image
@@ -109,22 +139,40 @@ class LanPaintMixIn(object):
                     mask = mask[:,0:1] # if mask is the same for all images, use the first one
             return mask
         mask = compress_tensor(mask)
-        for t, sigma, y_t in self.pipeline.progress_bar( zip( self.scheduler.timesteps, self.scheduler.sigmas[:-1], y_forward_diffusion ) ):
+        for t, abt, sigmas, y_t in self.pipeline.progress_bar( zip( self.scheduler.timesteps, self.abts[0], self.sigmas[0], y_forward_diffusion ) ):
             # 1. predict noise model_output
-            abt = 1/( 1+sigma**2 )
-            x_t = self.scheduler.scale_model_input(image, t ).to(y.device)
-            scale_factor = torch.mean( image * x_t ) / torch.mean( x_t ** 2 )
 
-            x_t = x_t * (1 - mask) + y_t * mask
-            step_size = self.step_size * (1 - abt)
+            # Check scale_model_input equivalence to model.model_sampling.noise_scaling in ComfyUI
+            x = self.scheduler.scale_model_input(image, t ).to(y.device)
+            scale_factor = torch.mean( image * x ) / torch.mean( x ** 2 )
 
-            current_times = (sigma, abt)
+            x = x * (1 - mask) + y_t * mask
 
+            # Translate x to VP-representation depending on model type
+            # VP-representation 
+            if self.is_flow:
+                x_t = x * (abt**0.5 + (1-abt)**0.5)
+            else:
+                x_t = x / (1 + sigmas ** 2)**0.5
             args = None
             for _ in range(self.n_steps):
-                score_func = partial( self.score_model, y = y, mask = mask, abt = abt, t = t )
-                # detect 
-                x_t, args = self.langevin_dynamics(x_t, score_func , mask, step_size, current_times, sigma_x = self.sigma_x(abt), sigma_y = self.sigma_y(abt), args = args)  
-            model_output = self.denoiser.cal_eps(x_t, t)
+                score_func = partial( self._score_model, y = y, mask = mask, abt = abt, t = t )
+                # Use constant step size here and apply the (1-abt) factor in sigma_x and sigma_y functions
+                x, args = self.langevin_dynamics(x, score_func , mask, self.step_size, abt, sigma_x = self._sigma_x(abt), sigma_y = self._sigma_y(abt), args = args)  
+            # Translate x to VP-representation depending on model type
+            if self.is_flow:
+                x_t = x * (abt**0.5 + (1-abt)**0.5)
+            else:
+                x_t = x / (1 + sigmas ** 2)**0.5
+            model_output = self.denoiser.cal_eps(x, t)
             # 2. compute previous image: x_t -> x_t-1
-            image = self.scheduler.step(model_output, t, x_t * scale_factor).prev_sample
+            image = self.scheduler.step(model_output, t, x * scale_factor).prev_sample
+    
+    def _sigma_x(self, abt: Tensor) -> Tensor:
+        return (1 - abt)**self.m
+    
+    def _sigma_y(self, abt: Tensor) -> Tensor:
+        return self.chara_beta * (1 - abt + abt * self.alpha) ** self.m
+    
+    def _score_model(self, x_t: Tensor, y: Tensor, mask: Tensor, abt: Tensor, t: Tensor):
+        pass
